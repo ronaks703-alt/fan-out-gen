@@ -113,4 +113,87 @@ def generate_fanout(primary_keyword: str, search_mode: str, llm: LLMClient, seed
         return []
 
 # ----------------- Streamlit UI -----------------
-st.set_page_config(page
+st.set_page_config(page_title="SEO Query Idea Generator", layout="wide")
+st.title("🔍 SEO Query Idea Generator")
+
+st.markdown("""
+**How it works:**  
+1. Pick **Google-Aware AI** for more accurate results.
+2. Enter your **Gemini API Key**.
+3. Enter your **keyword**.
+4. Generate two lists:
+   - 🟦 **Google-Based Queries** (from real Google AI Overview, if SerpAPI used)
+   - ⚪ **AI Suggestions** (AI-generated ideas)
+""")
+
+# Step 1 – Data Source
+st.header("Step 1 – Choose Data Source")
+data_source = st.radio("Pick your data source", [
+    "AI Only (quick, no Google data)",
+    "Google-Aware AI (requires SerpAPI key)"
+])
+
+# Step 2 – API Key for Gemini
+st.header("Step 2 – Enter Gemini API Key")
+api_key = st.text_input("Gemini API Key", type="password", value=st.secrets.get("GEMINI_KEY", ""))
+
+# Step 3 – SerpAPI Key (only if Google-Aware AI chosen)
+serpapi_key = ""
+if data_source == "Google-Aware AI (requires SerpAPI key)":
+    serpapi_key = st.text_input("SerpAPI Key", type="password", value=st.secrets.get("SERPAPI_KEY", ""))
+
+# Step 4 – Keyword
+st.header("Step 4 – Enter Keyword")
+keyword = st.text_input("Your keyword or topic:")
+
+# Generate Button
+if st.button("Generate Queries"):
+    if not keyword.strip():
+        st.error("Please enter a keyword.")
+    elif not api_key.strip():
+        st.error("Please provide your Gemini API key.")
+    else:
+        llm_config = configure_llm(api_key)
+        if not llm_config:
+            st.stop()
+        llm_client = LLMClient(llm_config)
+
+        # Try fetching AI Overview if SerpAPI provided
+        overview_text, citations, seeds = "", [], []
+        if serpapi_key.strip():
+            overview_data = fetch_ai_overview(keyword, serpapi_key)
+            overview_text = overview_data["text"]
+            citations = overview_data["citations"]
+            seeds = extract_entities_and_questions(overview_text, llm_client)
+
+        # Generate fan-out queries
+        queries = generate_fanout(keyword, "AI_Overview", llm_client, seed_queries=seeds)
+
+        # Mark sources
+        df = pd.DataFrame(queries)
+        if not df.empty:
+            df["source"] = df["query"].apply(lambda q: "Google-Based" if any(q.lower() in s.lower() or s.lower() in q.lower() for s in seeds) else "AI Suggestion")
+            
+            # Show Google Overview Snapshot if available
+            if overview_text:
+                with st.expander("📄 Google AI Overview Snapshot"):
+                    st.write(overview_text)
+                    if citations:
+                        st.markdown("**Sources cited by Google:**")
+                        for link in citations:
+                            st.markdown(f"- [{link}]({link})")
+
+            # Show Google-Based Queries
+            google_df = df[df["source"] == "Google-Based"]
+            if not google_df.empty:
+                st.subheader("🟦 Google-Based Queries")
+                st.dataframe(google_df.style.set_properties(**{'background-color': 'lightblue'}))
+
+            # Show AI Suggestions
+            ai_df = df[df["source"] == "AI Suggestion"]
+            if not ai_df.empty:
+                st.subheader("⚪ AI Suggestions")
+                st.dataframe(ai_df)
+
+        else:
+            st.warning("No queries generated.")
