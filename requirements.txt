@@ -1,0 +1,6 @@
+streamlit
+pandas
+serpapi
+google-generativeai
+openai
+anthropic
