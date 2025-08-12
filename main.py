@@ -3,26 +3,15 @@ import pandas as pd
 import json
 import re
 import serpapi
-import openai
-import anthropic
 import google.generativeai as genai
 
 # ----------------- LLM Provider Setup -----------------
-def configure_llm(provider: str, api_key: str):
-    if provider == "Gemini":
-        try:
-            genai.configure(api_key=api_key)
-            return {"provider": "gemini", "client": genai.GenerativeModel("gemini-1.5-flash")}
-        except Exception as e:
-            st.error(f"Gemini configuration failed: {e}")
-            return None
-    elif provider == "OpenAI":
-        openai.api_key = api_key
-        return {"provider": "openai"}
-    elif provider == "Claude":
-        return {"provider": "claude", "client": anthropic.Anthropic(api_key=api_key)}
-    else:
-        st.error("Unsupported provider")
+def configure_llm(api_key: str):
+    try:
+        genai.configure(api_key=api_key)
+        return {"provider": "gemini", "client": genai.GenerativeModel("gemini-1.5-flash")}
+    except Exception as e:
+        st.error(f"Gemini configuration failed: {e}")
         return None
 
 class LLMClient:
@@ -33,24 +22,14 @@ class LLMClient:
         provider = self.config["provider"]
         try:
             if provider == "gemini":
-                resp = self.config["client"].generate_content(prompt, temperature=temperature, max_output_tokens=max_tokens)
+                resp = self.config["client"].generate_content(
+                    prompt,
+                    generation_config={
+                        "temperature": temperature,
+                        "max_output_tokens": max_tokens
+                    }
+                )
                 return getattr(resp, "text", str(resp))
-            elif provider == "openai":
-                resp = openai.ChatCompletion.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=temperature,
-                    max_tokens=max_tokens
-                )
-                return resp.choices[0].message.content
-            elif provider == "claude":
-                resp = self.config["client"].messages.create(
-                    model="claude-3-haiku",
-                    max_tokens=max_tokens,
-                    temperature=temperature,
-                    messages=[{"role": "user", "content": prompt}]
-                )
-                return resp.content[0].text
         except Exception as e:
             st.error(f"Error generating with {provider}: {e}")
             return ""
@@ -134,13 +113,12 @@ st.title("🔍 SEO Query Idea Generator")
 
 st.markdown("""
 **How it works:**  
-1. Pick your data source  
-2. Choose AI provider  
-3. Enter your API keys  
-4. Type your keyword  
-5. Get two lists:
-- 🟦 Google-Based Queries → From real Google AI Overview (if SerpAPI used)  
-- ⚪ AI Suggestions → AI-generated keyword ideas
+1. Pick **Google-Aware AI** for more accurate results.
+2. Enter your **Gemini API Key**.
+3. Enter your **keyword**.
+4. Generate two lists:
+   - 🟦 **Google-Based Queries** (from real Google AI Overview, if SerpAPI used)
+   - ⚪ **AI Suggestions** (AI-generated ideas)
 """)
 
 # Step 1 – Data Source
@@ -150,13 +128,11 @@ data_source = st.radio("Pick your data source", [
     "Google-Aware AI (requires SerpAPI key)"
 ])
 
-# Step 2 – AI Provider
-st.header("Step 2 – Choose AI Provider")
-provider = st.selectbox("AI Provider", ["Gemini", "OpenAI", "Claude"])
+# Step 2 – API Key for Gemini
+st.header("Step 2 – Enter Gemini API Key")
+api_key = st.text_input("Gemini API Key", type="password", value=st.secrets.get("GEMINI_KEY", ""))
 
-# Step 3 – API Keys
-st.header("Step 3 – Enter API Keys")
-api_key = st.text_input(f"{provider} API Key", type="password", value=st.secrets.get(f"{provider.upper()}_KEY", ""))
+# Step 3 – SerpAPI Key (only if Google-Aware AI chosen)
 serpapi_key = ""
 if data_source == "Google-Aware AI (requires SerpAPI key)":
     serpapi_key = st.text_input("SerpAPI Key", type="password", value=st.secrets.get("SERPAPI_KEY", ""))
@@ -170,9 +146,9 @@ if st.button("Generate Queries"):
     if not keyword.strip():
         st.error("Please enter a keyword.")
     elif not api_key.strip():
-        st.error("Please provide your AI API key.")
+        st.error("Please provide your Gemini API key.")
     else:
-        llm_config = configure_llm(provider, api_key)
+        llm_config = configure_llm(api_key)
         if not llm_config:
             st.stop()
         llm_client = LLMClient(llm_config)
