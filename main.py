@@ -1,199 +1,148 @@
 import streamlit as st
-import pandas as pd
-import json
-import re
-import serpapi
 import google.generativeai as genai
+import json, re, time
+import pandas as pd
+from dataclasses import dataclass, asdict
+from datetime import datetime, timedelta
+from typing import List, Optional
 
-# ----------------- LLM Provider Setup -----------------
-def configure_llm(api_key: str):
-    try:
-        genai.configure(api_key=api_key)
-        return {"provider": "gemini", "client": genai.GenerativeModel("gemini-1.5-flash")}
-    except Exception as e:
-        st.error(f"Gemini configuration failed: {e}")
+# Streamlit page setup
+st.set_page_config(
+    page_title="AI Query Fan-Out Generator",
+    page_icon="🔍",
+    layout="wide"
+)
+
+@dataclass
+class SyntheticQuery:
+    query: str
+    type: str
+    user_intent: str
+    reasoning: str
+    confidence_score: float
+
+# ===== Helper: Robust JSON extraction =====
+def safe_json_extract(raw_text: str):
+    # Remove markdown fences
+    if "```json" in raw_text:
+        raw_text = raw_text.split("```json")[1].split("```")[0]
+    elif "```" in raw_text:
+        raw_text = raw_text.split("```")[1]
+    
+    # Find JSON object
+    match = re.search(r"\{.*\}", raw_text, re.S)
+    if not match:
         return None
 
-class LLMClient:
-    def __init__(self, config: dict):
-        self.config = config
+    json_str = match.group()
+    # Remove trailing commas
+    json_str = re.sub(r",\s*([\]}])", r"\1", json_str)
 
-    def generate(self, prompt: str, temperature: float = 0.7, max_tokens: int = 800) -> str:
-        provider = self.config["provider"]
-        try:
-            if provider == "gemini":
-                resp = self.config["client"].generate_content(
-                    prompt,
-                    generation_config={
-                        "temperature": temperature,
-                        "max_output_tokens": max_tokens
-                    }
-                )
-                # Log the response from Gemini to debug the output
-                st.write("Gemini Response:", resp.text)  # This will print the response to the Streamlit UI for debugging
-                return getattr(resp, "text", str(resp))
-        except Exception as e:
-            st.error(f"Error generating with {provider}: {e}")
-            return ""
-
-# ----------------- SerpAPI fetch -----------------
-def fetch_ai_overview(keyword: str, serpapi_key: str):
     try:
-        client = serpapi.GoogleSearch({"q": keyword, "engine": "google", "api_key": serpapi_key})
-        results = client.get_dict()
-        overview = results.get("ai_overview", {})
-        return {
-            "text": overview.get("text", ""),
-            "citations": [c.get("link") for c in overview.get("citations", []) if c.get("link")]
-        }
-    except Exception as e:
-        st.warning(f"SerpAPI fetch failed: {e}")
-        return {"text": "", "citations": []}
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        return None
 
-# ----------------- Entity & question extraction -----------------
-def extract_entities_and_questions(overview_text: str, llm: LLMClient):
-    if not overview_text.strip():
-        return []
-    prompt = f"""
-    You are given Google's AI Overview text:
-    \"\"\"{overview_text}\"\"\"
-    Extract a list of up to 10 important search queries from it, including:
-    - Questions mentioned or implied
-    - Entities, names, or topics worth searching
-    Return JSON with a 'queries' array, no extra text.
-    """
-    raw = llm.generate(prompt)
-    try:
-        parsed = json.loads(re.search(r'\{.*\}', raw, re.S).group())
-        return parsed.get("queries", [])
-    except:
-        return []
+# ===== Core generator class =====
+class QueryFanOutGenerator:
+    def __init__(self, api_key: str):
+        genai.configure(api_key=api_key)
+        self.model = genai.GenerativeModel("gemini-2.0-flash")
+    
+    def build_prompt(self, keyword: str, mode: str):
+        return f"""
+You are an SEO keyword expansion assistant.
 
-# ----------------- Fan-out generation -----------------
-def generate_fanout(primary_keyword: str, search_mode: str, llm: LLMClient, seed_queries=None):
-    seed_text = ""
-    if seed_queries:
-        seed_text = "\nThese are seed queries from Google's AI Overview:\n" + "\n".join(f"- {q}" for q in seed_queries)
-    target_range = "10-15" if search_mode == "AI_Overview" else "15-20"
-    prompt = f"""
-    Generate {target_range} diverse, high-quality search queries for the topic "{primary_keyword}".
-    Include a mix of:
-    - Reformulations
-    - Related queries
-    - Comparisons
-    - How-to's
-    For each query, also return:
-    - type (reformulation, related_query, comparative_query, how_to, etc.)
-    - user_intent (informational, commercial, transactional, navigational)
-    - reasoning
-    - confidence_score (0-1)
+Primary Keyword: "{keyword}"
 
-    Output as JSON:
+Mode: {"AI Overview (10-15 queries)" if mode=="overview" else "AI Mode (15-20 queries)"}
+
+Instructions:
+1. Generate diverse related search queries.
+2. Cover informational, commercial, transactional, and navigational intents.
+3. Output ONLY valid JSON in this format:
+{{
+  "query_count_reasoning": "why you chose N queries",
+  "synthetic_queries": [
     {{
-      "synthetic_queries": [
-        {{
-          "query": "...",
-          "type": "...",
-          "user_intent": "...",
-          "reasoning": "...",
-          "confidence_score": 0.85
-        }}
-      ]
+      "query": "text",
+      "type": "reformulation|related_query|comparative_query|how_to",
+      "user_intent": "informational|commercial|transactional|navigational",
+      "reasoning": "short reason",
+      "confidence_score": 0.0
     }}
-    {seed_text}
-    """
-    raw = llm.generate(prompt)
-    # Log the raw response to check if queries are being returned
-    st.write("Raw Response from LLM:", raw)  # This will show the raw data for debugging purposes
-    try:
-        parsed = json.loads(re.search(r'\{.*\}', raw, re.S).group())
-        return parsed.get("synthetic_queries", [])
-    except Exception as e:
-        st.error(f"Error parsing LLM response: {e}")
-        return []
+  ]
+}}
+"""
+    
+    def generate(self, keyword: str, mode: str):
+        prompt = self.build_prompt(keyword, mode)
+        try:
+            response = self.model.generate_content(prompt)
+            parsed = safe_json_extract(response.text)
+            if not parsed:
+                return None
+            queries = [
+                SyntheticQuery(
+                    query=q["query"],
+                    type=q["type"],
+                    user_intent=q.get("user_intent", ""),
+                    reasoning=q["reasoning"],
+                    confidence_score=q.get("confidence_score", 0.0)
+                )
+                for q in parsed.get("synthetic_queries", [])
+            ]
+            return {
+                "primary_keyword": keyword,
+                "query_count_reasoning": parsed.get("query_count_reasoning", ""),
+                "synthetic_queries": [asdict(q) for q in queries]
+            }
+        except Exception as e:
+            st.error(f"Error generating queries: {str(e)}")
+            return None
 
-# ----------------- Streamlit UI -----------------
-st.set_page_config(page_title="SEO Query Idea Generator", layout="wide")
-st.title("🔍 SEO Query Idea Generator")
+# ===== UI =====
+st.title("🔍 AI Query Fan-Out Generator (Gemini Only)")
+st.markdown("Generate SEO-friendly keyword expansions instantly with AI.")
 
-st.markdown("""
-**How it works:**  
-1. Pick **Google-Aware AI** for more accurate results.
-2. Enter your **Gemini API Key**.
-3. Enter your **keyword**.
-4. Generate two lists:
-   - 🟦 **Google-Based Queries** (from real Google AI Overview, if SerpAPI used)
-   - ⚪ **AI Suggestions** (AI-generated ideas)
-""")
+# API key input
+api_key = st.sidebar.text_input("Enter your Gemini API Key", type="password")
+if not api_key:
+    st.sidebar.info("Get your API key from [Google AI Studio](https://makersuite.google.com/app/apikey)")
 
-# Step 1 – Data Source
-st.header("Step 1 – Choose Data Source")
-data_source = st.radio("Pick your data source", [
-    "AI Only (quick, no Google data)",
-    "Google-Aware AI (requires SerpAPI key)"
-])
+# Mode select
+mode = st.radio("Choose Generation Mode", ["overview", "full"], format_func=lambda x: "AI Overview" if x=="overview" else "AI Mode")
 
-# Step 2 – API Key for Gemini
-st.header("Step 2 – Enter Gemini API Key")
-api_key = st.text_input("Gemini API Key", type="password", value=st.secrets.get("GEMINI_KEY", ""))
+# Keyword input LAST
+keyword = st.text_input("Enter Primary Keyword", placeholder="e.g., Wonderla amusement park")
 
-# Step 3 – SerpAPI Key (only if Google-Aware AI chosen)
-serpapi_key = ""
-if data_source == "Google-Aware AI (requires SerpAPI key)":
-    serpapi_key = st.text_input("SerpAPI Key", type="password", value=st.secrets.get("SERPAPI_KEY", ""))
-
-# Step 4 – Keyword
-st.header("Step 4 – Enter Keyword")
-keyword = st.text_input("Your keyword or topic:")
-
-# Generate Button
-if st.button("Generate Queries"):
-    if not keyword.strip():
-        st.error("Please enter a keyword.")
-    elif not api_key.strip():
-        st.error("Please provide your Gemini API key.")
+# Generate button
+if st.button("Generate Queries") and api_key and keyword:
+    with st.spinner("Generating..."):
+        gen = QueryFanOutGenerator(api_key)
+        result = gen.generate(keyword, mode)
+    
+    if result:
+        st.subheader(f"Results for: {keyword}")
+        st.write(f"**Reasoning:** {result['query_count_reasoning']}")
+        
+        df = pd.DataFrame(result["synthetic_queries"])
+        st.dataframe(df, use_container_width=True)
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.download_button(
+                "📥 Download CSV",
+                df.to_csv(index=False),
+                file_name=f"{keyword.replace(' ','_')}_queries.csv",
+                mime="text/csv"
+            )
+        with col2:
+            st.download_button(
+                "📥 Download JSON",
+                json.dumps(result, indent=2),
+                file_name=f"{keyword.replace(' ','_')}_queries.json",
+                mime="application/json"
+            )
     else:
-        llm_config = configure_llm(api_key)
-        if not llm_config:
-            st.stop()
-        llm_client = LLMClient(llm_config)
-
-        # Try fetching AI Overview if SerpAPI provided
-        overview_text, citations, seeds = "", [], []
-        if serpapi_key.strip():
-            overview_data = fetch_ai_overview(keyword, serpapi_key)
-            overview_text = overview_data["text"]
-            citations = overview_data["citations"]
-            seeds = extract_entities_and_questions(overview_text, llm_client)
-
-        # Generate fan-out queries
-        queries = generate_fanout(keyword, "AI_Overview", llm_client, seed_queries=seeds)
-
-        # Mark sources
-        df = pd.DataFrame(queries)
-        if not df.empty:
-            df["source"] = df["query"].apply(lambda q: "Google-Based" if any(q.lower() in s.lower() or s.lower() in q.lower() for s in seeds) else "AI Suggestion")
-            
-            # Show Google Overview Snapshot if available
-            if overview_text:
-                with st.expander("📄 Google AI Overview Snapshot"):
-                    st.write(overview_text)
-                    if citations:
-                        st.markdown("**Sources cited by Google:**")
-                        for link in citations:
-                            st.markdown(f"- [{link}]({link})")
-
-            # Show Google-Based Queries
-            google_df = df[df["source"] == "Google-Based"]
-            if not google_df.empty:
-                st.subheader("🟦 Google-Based Queries")
-                st.dataframe(google_df.style.set_properties(**{'background-color': 'lightblue'}))
-
-            # Show AI Suggestions
-            ai_df = df[df["source"] == "AI Suggestion"]
-            if not ai_df.empty:
-                st.subheader("⚪ AI Suggestions")
-                st.dataframe(ai_df)
-
-        else:
-            st.warning("No queries generated.")
+        st.warning("No queries generated. Try rephrasing your keyword.")
